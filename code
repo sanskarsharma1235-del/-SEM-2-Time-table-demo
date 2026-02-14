@@ -1,1 +1,835 @@
 
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { 
+  BookOpen, Calendar as CalendarIcon, CheckSquare, BarChart2, Plus, Trash2, 
+  ChevronRight, ChevronDown, ChevronLeft, AlertCircle, Menu, X, Target, 
+  List, CheckCircle2, Book, Moon, Sun, Edit2, Save, Sparkles, Loader2, 
+  StickyNote, Search, Filter, Lightbulb, Zap, ArrowRight, Layers, MessageSquare, Send, Wand2
+} from 'lucide-react';
+import { initializeApp } from "firebase/app";
+import { getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken } from "firebase/auth";
+import { 
+  getFirestore, collection, doc, setDoc, addDoc, deleteDoc, updateDoc, 
+  onSnapshot, serverTimestamp, writeBatch 
+} from "firebase/firestore";
+
+// --- Configuration & Constants ---
+const APP_NAME = "Semester 2 Planner by Sanskar Sharma";
+const APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'study-sync-pro';
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// --- Gemini API Integration ---
+const callGemini = async (prompt, isJson = false) => {
+  const apiKey = ""; // Environment provided
+  const model = "gemini-2.5-flash-preview-09-2025";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  
+  const backoff = [1000, 2000, 4000, 8000, 16000];
+  
+  for (let i = 0; i <= backoff.length; i++) {
+    try {
+      const payload = {
+        contents: [{ parts: [{ text: prompt }] }],
+        ...(isJson && { 
+          generationConfig: { 
+            responseMimeType: "application/json" 
+          } 
+        })
+      };
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) throw new Error("API request failed");
+      
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      
+      if (isJson) {
+        try {
+          return JSON.parse(text);
+        } catch (e) {
+          console.error("Failed to parse JSON from Gemini:", text);
+          return [];
+        }
+      }
+      return text;
+    } catch (error) {
+      if (i === backoff.length) {
+        throw new Error("Unable to connect to Study Buddy right now. Please try again later.");
+      }
+      await new Promise(resolve => setTimeout(resolve, backoff[i]));
+    }
+  }
+};
+
+// --- Real Syllabus Data from Uploaded PDFs ---
+const SUBJECTS_DATABASE = [
+  {
+    id: 'MAT2003',
+    name: 'Applied Numerical Methods',
+    code: 'MAT2003',
+    color: 'cyan',
+    units: [
+      { title: "Unit 1: Nonlinear Equations", topics: ["Bisection Method", "Fixed point Iteration", "Secant Method", "Newton-Raphson Method", "Convergence Rates"] },
+      { title: "Unit 2: Linear Systems", topics: ["Gauss-Elimination", "Gauss-Seidel Iteration", "Jacobi Method", "Diagonal Dominance"] },
+      { title: "Unit 3: Interpolation", topics: ["Newton's Forward/Backward", "Stirling/Lagrange Interpolation", "Divided Differences", "Cubic Splines"] },
+      { title: "Unit 4: Numerical Calculus", topics: ["Numerical Differentiation", "Trapezoidal Rule", "Simpson’s 1/3 and 3/8 Rules", "Gaussian Quadrature"] },
+      { title: "Unit 5: Diff Equations", topics: ["Euler's Method", "Runge-Kutta 4th Order", "Finite Difference (BVP)", "Laplace & Poisson Equations"] }
+    ]
+  },
+  {
+    id: 'CSE2001',
+    name: 'OOP with C++',
+    code: 'CSE2001',
+    color: 'blue',
+    units: [
+      { title: "Unit 1: OOP Approach", topics: ["Encapsulation", "Data Abstraction", "Polymorphism", "Inline Functions", "Default Arguments", "Pass by Reference"] },
+      { title: "Unit 2: Classes & Objects", topics: ["Access Specifiers", "Constructors & Destructors", "Copy Constructor", "Array of Objects", "Friend Functions"] },
+      { title: "Unit 3: Inheritance", topics: ["Compile-time Polymorphism", "Operator Overloading", "Multiple Inheritance", "Virtual Functions", "Abstract Base Class"] },
+      { title: "Unit 4: Templates & STL", topics: ["Function Templates", "Class Templates", "STL Containers (Vector, List, Stack, Map)", "Iterators"] },
+      { title: "Unit 5: IOStreams & Files", topics: ["Manipulators", "Sequential vs Random Files", "Binary Files", "Inserters & Extractors Overloading"] }
+    ]
+  },
+  {
+    id: 'EEE1001',
+    name: 'Electric Circuits',
+    code: 'EEE1001',
+    color: 'violet',
+    units: [
+      { title: "Unit 1: DC Analysis", topics: ["Ohm's & Kirchhoff's Laws", "Mesh & Nodal Analysis", "Thevenin & Norton Theorems", "Superposition Theorem"] },
+      { title: "Unit 2: AC Analysis", topics: ["RMS & Average Values", "Phasors", "RLC Series & Parallel", "Resonance", "Natural vs Forced Response"] },
+      { title: "Unit 3: Magnetic Circuits", topics: ["Self & Mutual Induction", "Transformers", "DC Motor & Generator", "Induction Motors (1ph & 3ph)"] },
+      { title: "Unit 4: Semiconductors", topics: ["PN Junction Characteristics", "Half/Full Wave Rectifiers", "Zener Regulator", "BJT CE Amplifier", "MOSFETs"] },
+      { title: "Unit 5: Digital Systems", topics: ["Number Systems", "Logic Gates", "Arithmetic Circuits", "MUX/DEMUX", "Flip-Flops"] }
+    ]
+  },
+  {
+    id: 'CHY1005',
+    name: 'Computational Chemistry',
+    code: 'CHY1005',
+    color: 'amber',
+    units: [
+      { title: "Unit 1: Overview", topics: ["History of Simulation", "Tools for Comp Chem", "Units & Errors"] },
+      { title: "Unit 2: Quantum Chemistry", topics: ["Schrodinger Equation", "Wave Functions", "Particle in a Box", "Hydrogen Atom Solutions"] },
+      { title: "Unit 3: Thermodynamics", topics: ["State vs Path Functions", "Spontaneity & Entropy", "Gibbs Free Energy", "Maxwell Relations"] },
+      { title: "Unit 4: Potential Energy", topics: ["Intermolecular Forces", "London Dispersion", "repulsive interactions", "Bond Stretching/Bending"] },
+      { title: "Unit 5: Molecular Dynamics", topics: ["Ensembles", "Newton's Laws Integration", "Periodic Boundary Conditions", "Energy Minimization"] }
+    ]
+  },
+  {
+    id: 'UHV0002',
+    name: 'Human Values II',
+    code: 'UHV0002',
+    color: 'rose',
+    units: [
+      { title: "Unit 1: Basic Aspirations", topics: ["Right Understanding", "Resolution for Human Being", "Solution through Resolution"] },
+      { title: "Unit 2: Knowing Nature", topics: ["Knower, Known & Process", "Interconnectedness", "Role of Human in Existence"] },
+      { title: "Unit 3: Human Being", topics: ["Co-existence of Self & Body", "Activities of the Self", "Harmony in Self"] },
+      { title: "Unit 4: Existence", topics: ["Self-Awareness & Evaluation", "Realization of Co-Existence", "Harmony in Order"] },
+      { title: "Unit 5: Conduct", topics: ["Wisdom & Science", "Holistic Way of Living", "Dimensions of Human Endeavour"] }
+    ]
+  },
+  {
+    id: 'CSE0001',
+    name: 'Digital Literacy',
+    code: 'CSE0001',
+    color: 'emerald',
+    units: [
+      { title: "Unit 1: Presentation", topics: ["Microsoft PowerPoint", "Canva", "Excel Formulas", "Excel Charts"] },
+      { title: "Unit 2: Programming", topics: ["Google Workspace", "HackerRank", "CodeChef", "Virtual Labs"] },
+      { title: "Unit 3: Digital Portfolio", topics: ["LinkedIn", "GitHub", "Quora", "ResearchGate"] },
+      { title: "Unit 4: Email Etiquette", topics: ["Professional Communication", "Email Signatures", "Choice of Fonts"] },
+      { title: "Unit 5: Cyber Security", topics: ["Cyber Crime Types", "Financial Fraud", "Digital Hygiene"] }
+    ]
+  }
+];
+
+const TIMETABLE_SEED = {
+  "Mon-10:00": "MAT2003", "Mon-11:40": "CHY1005", "Mon-16:25": "UHV0002", "Mon-18:00": "CSE0001",
+  "Tue-10:05": "EEE1001", "Tue-18:00": "CSE2001",
+  "Wed-10:00": "MAT2003", "Wed-11:40": "CHY1005", "Wed-16:25": "CSE2001",
+  "Thu-10:05": "EEE1001", "Thu-16:25": "UHV0002",
+  "Fri-11:40": "CHY1005", "Fri-14:50": "EEE1001", "Fri-18:00": "CSE2001"
+};
+
+// --- Components ---
+
+const GlassCard = ({ children, className = "", delay = "0s" }) => (
+  <div 
+    className={`bg-white/80 dark:bg-slate-800/80 backdrop-blur-md rounded-2xl border border-slate-200/50 dark:border-slate-700/50 shadow-xl shadow-slate-200/20 dark:shadow-none transition-all hover:shadow-2xl hover:-translate-y-1 animate-fade-in ${className}`}
+    style={{ animationDelay: delay }}
+  >
+    {children}
+  </div>
+);
+
+const AnimatedProgressBar = ({ value, max = 100, color = "indigo" }) => {
+  const percentage = Math.min(100, Math.max(0, (value / max) * 100));
+  const colors = {
+    indigo: "bg-indigo-500", emerald: "bg-emerald-500", amber: "bg-amber-500",
+    rose: "bg-rose-500", cyan: "bg-cyan-500", blue: "bg-blue-500", violet: "bg-violet-500"
+  };
+  return (
+    <div className="h-2.5 w-full bg-slate-100 dark:bg-slate-700/50 rounded-full overflow-hidden text-[0px]">
+      <div 
+        className={`h-full transition-all duration-1000 ease-out ${colors[color] || colors.indigo}`} 
+        style={{ width: `${percentage}%` }} 
+      />
+    </div>
+  );
+};
+
+// --- MAIN APPLICATION ---
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [darkMode, setDarkMode] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [isAiChatOpen, setIsAiChatOpen] = useState(false);
+
+  // Firestore Data State
+  const [subjects, setSubjects] = useState([]);
+  const [timetable, setTimetable] = useState({});
+  const [weeklyPlan, setWeeklyPlan] = useState([]);
+  const [events, setEvents] = useState([]);
+  const [notes, setNotes] = useState([]);
+  const [progress, setProgress] = useState({});
+
+  // Theme Logic
+  useEffect(() => {
+    if (darkMode) document.documentElement.classList.add('dark');
+    else document.documentElement.classList.remove('dark');
+  }, [darkMode]);
+
+  // Auth & Init
+  useEffect(() => {
+    const initAuth = async () => {
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+    return onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      if (!u) setLoading(false);
+    });
+  }, []);
+
+  // Data Sync
+  useEffect(() => {
+    if (!user) return;
+    const basePath = `artifacts/${APP_ID}/users/${user.uid}`;
+
+    const unsubSubjects = onSnapshot(collection(db, basePath, 'subjects'), async (snap) => {
+      if (snap.empty) {
+        const batch = writeBatch(db);
+        SUBJECTS_DATABASE.forEach(s => batch.set(doc(collection(db, basePath, 'subjects')), s));
+        await batch.commit();
+      } else {
+        setSubjects(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+    });
+
+    const unsubTimetable = onSnapshot(collection(db, basePath, 'timetable'), async (snap) => {
+      if (snap.empty) {
+        const batch = writeBatch(db);
+        Object.entries(TIMETABLE_SEED).forEach(([key, code]) => batch.set(doc(db, basePath, 'timetable', key), { code }));
+        await batch.commit();
+      } else {
+        const sched = {};
+        snap.docs.forEach(d => sched[d.id] = d.data().code);
+        setTimetable(sched);
+      }
+    });
+
+    const unsubPlan = onSnapshot(collection(db, basePath, 'weeklyPlan'), s => setWeeklyPlan(s.docs.map(d => ({ id: d.id, ...d.data() }))));
+    const unsubEvents = onSnapshot(collection(db, basePath, 'events'), s => setEvents(s.docs.map(d => ({ id: d.id, ...d.data() }))));
+    const unsubNotes = onSnapshot(collection(db, basePath, 'notes'), s => setNotes(s.docs.map(d => ({ id: d.id, ...d.data() }))));
+    const unsubProgress = onSnapshot(collection(db, basePath, 'progress'), s => {
+      const p = {};
+      s.docs.forEach(d => p[d.id] = d.data().completedTopics || []);
+      setProgress(p);
+      setLoading(false);
+    });
+
+    return () => {
+      unsubSubjects(); unsubTimetable(); unsubPlan(); unsubEvents(); unsubNotes(); unsubProgress();
+    };
+  }, [user]);
+
+  const renderTab = () => {
+    if (loading) return <LoadingScreen />;
+    switch(activeTab) {
+      case 'dashboard': return <Dashboard subjects={subjects} progress={progress} weeklyPlan={weeklyPlan} timetable={timetable} />;
+      case 'planner': return <WeeklyPlanner subjects={subjects} weeklyPlan={weeklyPlan} userId={user.uid} />;
+      case 'calendar': return <CalendarView timetable={timetable} subjects={subjects} events={events} userId={user.uid} />;
+      case 'syllabus': return <SyllabusTracker subjects={subjects} progress={progress} userId={user.uid} />;
+      case 'notes': return <NotesWall subjects={subjects} notes={notes} userId={user.uid} />;
+      case 'timetable': return <TimetableEditor subjects={subjects} timetable={timetable} userId={user.uid} />;
+      default: return <Dashboard subjects={subjects} progress={progress} weeklyPlan={weeklyPlan} timetable={timetable} />;
+    }
+  };
+
+  return (
+    <div className="flex h-screen bg-slate-50 dark:bg-slate-900 overflow-hidden text-slate-900 dark:text-slate-100 transition-colors duration-500">
+      <aside className={`fixed inset-y-0 left-0 z-50 w-64 bg-white/90 dark:bg-slate-800/90 backdrop-blur-xl border-r border-slate-200 dark:border-slate-700 transform transition-transform duration-500 ease-in-out md:relative md:translate-x-0 ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+        <div className="p-8 pb-4">
+          <div className="flex items-center gap-3 text-indigo-600 dark:text-indigo-400 mb-2">
+            <Zap className="fill-current w-8 h-8 animate-pulse" />
+            <span className="font-black text-2xl tracking-tighter uppercase">StudySync</span>
+          </div>
+          <p className="text-[10px] uppercase font-bold text-slate-400 dark:text-slate-500 tracking-widest leading-none">by Sanskar Sharma</p>
+        </div>
+
+        <nav className="p-4 space-y-1 mt-4">
+          <NavBtn icon={<BarChart2 size={18} />} label="Dashboard" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} />
+          <NavBtn icon={<Target size={18} />} label="Weekly Plan" active={activeTab === 'planner'} onClick={() => setActiveTab('planner')} />
+          <NavBtn icon={<CalendarIcon size={18} />} label="Monthly Calendar" active={activeTab === 'calendar'} onClick={() => setActiveTab('calendar')} />
+          <NavBtn icon={<StickyNote size={18} />} label="Sticky Wall" active={activeTab === 'notes'} onClick={() => setActiveTab('notes')} />
+          <NavBtn icon={<List size={18} />} label="Syllabus Tracker" active={activeTab === 'syllabus'} onClick={() => setActiveTab('syllabus')} />
+          <NavBtn icon={<Book size={18} />} label="Timetable" active={activeTab === 'timetable'} onClick={() => setActiveTab('timetable')} />
+        </nav>
+
+        <div className="absolute bottom-8 left-0 w-full px-4">
+          <button 
+            onClick={() => setDarkMode(!darkMode)}
+            className="w-full flex items-center justify-between p-4 rounded-2xl bg-slate-100 dark:bg-slate-700/50 hover:bg-slate-200 dark:hover:bg-slate-700 transition-all group"
+          >
+            <div className="flex items-center gap-3">
+              {darkMode ? <Sun size={18} className="text-amber-400" /> : <Moon size={18} className="text-indigo-600" />}
+              <span className="text-sm font-bold">{darkMode ? 'Light' : 'Dark'} Mode</span>
+            </div>
+          </button>
+        </div>
+      </aside>
+
+      <main className="flex-1 flex flex-col relative overflow-hidden">
+        <header className="md:hidden p-4 bg-white/80 dark:bg-slate-800/80 backdrop-blur-md flex justify-between items-center border-b border-slate-200 dark:border-slate-700 z-40">
+           <h1 className="font-black tracking-tight text-indigo-600 dark:text-indigo-400">STUDYSYNC</h1>
+           <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 bg-slate-100 dark:bg-slate-700 rounded-xl"><Menu size={20}/></button>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-4 md:p-12 custom-scrollbar">
+           <div className="max-w-7xl mx-auto h-full">
+              {renderTab()}
+           </div>
+        </div>
+
+        {/* AI Co-Pilot Floating Button */}
+        <button 
+          onClick={() => setIsAiChatOpen(!isAiChatOpen)}
+          className="fixed bottom-8 right-8 w-16 h-16 rounded-2xl bg-gradient-to-tr from-indigo-600 to-purple-600 text-white shadow-2xl flex items-center justify-center hover:scale-110 active:scale-95 transition-all z-50 group"
+        >
+          {isAiChatOpen ? <X size={24} /> : <Sparkles className="animate-pulse" size={24} />}
+        </button>
+
+        {isAiChatOpen && <AiChatWindow subjects={subjects} onClose={() => setIsAiChatOpen(false)} />}
+      </main>
+
+      <style>{`
+        @keyframes fade-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-fade-in { animation: fade-in 0.4s ease-out forwards; opacity: 0; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 20px; }
+        .dark .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; }
+      `}</style>
+    </div>
+  );
+}
+
+const NavBtn = ({ icon, label, active, onClick }) => (
+  <button 
+    onClick={onClick}
+    className={`w-full flex items-center gap-4 px-5 py-4 rounded-2xl transition-all duration-300 font-bold text-sm ${
+      active 
+        ? 'bg-indigo-600 text-white shadow-lg' 
+        : 'text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-700/50'
+    }`}
+  >
+    {icon}
+    {label}
+  </button>
+);
+
+const LoadingScreen = () => (
+  <div className="flex flex-col items-center justify-center h-full gap-4 text-indigo-600 dark:text-indigo-400">
+     <div className="w-16 h-16 border-4 border-current border-t-transparent rounded-full animate-spin" />
+     <p className="font-black text-xl tracking-widest animate-pulse uppercase">Syncing Workspace...</p>
+  </div>
+);
+
+// --- AI CHAT WINDOW ---
+function AiChatWindow({ subjects, onClose }) {
+  const [messages, setMessages] = useState([
+    { role: 'ai', text: "Hey Sanskar! I'm your Study Copilot. How can I help you with your semester today? ✨" }
+  ]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const handleSend = async () => {
+    if (!input.trim() || isLoading) return;
+    
+    const userMsg = input;
+    setInput('');
+    setMessages(prev => [...prev, { role: 'user', text: userMsg }]);
+    setIsLoading(true);
+
+    try {
+      const subjectContext = subjects.map(s => `${s.code}: ${s.name}`).join(', ');
+      const prompt = `User (Sanskar) says: "${userMsg}". 
+      Context: Sanskar is in his 2nd semester taking these courses: ${subjectContext}. 
+      Act as a helpful, academic, yet encouraging AI Study Copilot. 
+      Help him with study tips, course-specific questions, or motivation. Keep responses concise but high-value.`;
+      
+      const response = await callGemini(prompt);
+      setMessages(prev => [...prev, { role: 'ai', text: String(response) }]);
+    } catch (e) {
+      setMessages(prev => [...prev, { role: 'ai', text: e.message }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed bottom-28 right-8 w-96 h-[500px] bg-white dark:bg-slate-800 rounded-3xl border border-slate-200 dark:border-slate-700 shadow-2xl z-50 flex flex-col overflow-hidden animate-fade-in">
+      <div className="p-4 border-b border-slate-100 dark:border-slate-700 bg-indigo-600 text-white flex justify-between items-center">
+        <div className="flex items-center gap-2">
+          <Sparkles size={18} />
+          <span className="font-black text-sm uppercase tracking-wider">AI Study Copilot</span>
+        </div>
+        <button onClick={onClose} className="p-1 hover:bg-white/20 rounded-lg"><X size={18}/></button>
+      </div>
+      
+      <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+        {messages.map((m, i) => (
+          <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-[80%] p-3 rounded-2xl text-sm ${
+              m.role === 'user' 
+                ? 'bg-indigo-600 text-white rounded-tr-none' 
+                : 'bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-200 rounded-tl-none'
+            }`}>
+              {m.text}
+            </div>
+          </div>
+        ))}
+        {isLoading && (
+          <div className="flex justify-start">
+            <div className="bg-slate-100 dark:bg-slate-700 p-3 rounded-2xl rounded-tl-none flex items-center gap-2">
+              <Loader2 className="animate-spin text-indigo-500" size={14} />
+              <span className="text-xs text-slate-400">Thinking...</span>
+            </div>
+          </div>
+        )}
+        <div ref={scrollRef} />
+      </div>
+
+      <div className="p-4 border-t border-slate-100 dark:border-slate-700">
+        <div className="flex gap-2">
+          <input 
+            className="flex-1 bg-slate-100 dark:bg-slate-700 p-2 rounded-xl text-sm outline-none border border-transparent focus:border-indigo-500 transition-colors"
+            placeholder="Ask anything..."
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && handleSend()}
+          />
+          <button onClick={handleSend} className="p-2 bg-indigo-600 text-white rounded-xl hover:scale-105 active:scale-95 transition-all">
+            <Send size={18} />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- DASHBOARD COMPONENT ---
+function Dashboard({ subjects, progress, weeklyPlan, timetable }) {
+  const [strategy, setStrategy] = useState(null);
+  const [isGenerating, setIsGenerating] = useState(false);
+
+  const totalTopics = subjects.reduce((acc, s) => acc + s.units.reduce((uAcc, u) => uAcc + u.topics.length, 0), 0);
+  const finishedTopics = Object.values(progress).reduce((acc, topics) => acc + topics.length, 0);
+  const overallProgress = totalTopics ? Math.round((finishedTopics / totalTopics) * 100) : 0;
+
+  const generateStrategy = async () => {
+    setIsGenerating(true);
+    setStrategy(null);
+    try {
+      const progressDetails = subjects.map(s => {
+        const done = (progress[s.id] || []).length;
+        const total = s.units.reduce((acc, u) => acc + u.topics.length, 0);
+        return `${s.code} (${s.name}): ${done}/${total} topics completed.`;
+      }).join('\n');
+
+      const prompt = `Analyze this student's (Sanskar) current syllabus progress and generate a "Mastery Strategy ✨". 
+      Progress Data:
+      ${progressDetails}
+      
+      Identify the 2 subjects needing the most attention and provide a 3-step actionable study plan for this week. Keep it punchy and academic. Start with a structured "High Priority" header.`;
+      
+      const res = await callGemini(prompt);
+      setStrategy(String(res));
+    } catch (e) {
+      setStrategy("Error generating strategy. Check connection.");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const today = new Date().toLocaleDateString('en-US', { weekday: 'short' });
+  const todaysClasses = Object.entries(timetable)
+    .filter(([key]) => key.startsWith(today))
+    .sort()
+    .map(([key, code]) => ({ time: key.split('-')[1], sub: subjects.find(s => s.code === code) }));
+
+  return (
+    <div className="space-y-8 pb-20">
+      <div className="flex justify-between items-end">
+        <div>
+          <h2 className="text-4xl font-black tracking-tight mb-2">Workspace Overview</h2>
+          <p className="text-slate-500 dark:text-slate-400 font-medium italic">Empowered by Gemini Assistant ✨</p>
+        </div>
+        <div className="hidden md:flex gap-4">
+           <CardStat label="Overall Course" value={`${overallProgress}%`} subLabel="Syllabus Done" />
+           <CardStat label="Subjects Active" value={subjects.length} subLabel="Linked Core" />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+         <div className="lg:col-span-2 space-y-8">
+            <GlassCard className="p-8">
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="text-xl font-bold flex items-center gap-2">
+                  <Layers className="text-indigo-500" /> Subject Proficiency
+                </h3>
+                <Button onClick={generateStrategy} disabled={isGenerating} variant="gemini" size="sm">
+                  {isGenerating ? <Loader2 className="animate-spin" size={16}/> : <Sparkles size={16}/>}
+                  Generate Strategy ✨
+                </Button>
+              </div>
+
+              {strategy && (
+                <div className="mb-8 p-6 bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800 rounded-3xl animate-fade-in text-sm text-slate-700 dark:text-slate-300 whitespace-pre-wrap">
+                  <div className="flex items-center gap-2 mb-2 text-indigo-600 dark:text-indigo-400 font-black uppercase tracking-widest text-xs">
+                    <Sparkles size={14} /> AI Recommendation
+                  </div>
+                  {strategy}
+                </div>
+              )}
+
+              <div className="space-y-8">
+                {subjects.map((sub, i) => {
+                  const done = (progress[sub.id] || []).length;
+                  const subTotal = sub.units.reduce((acc, u) => acc + u.topics.length, 0);
+                  return (
+                    <div key={sub.id} className="animate-fade-in" style={{ animationDelay: `${i * 0.1}s` }}>
+                      <div className="flex justify-between text-sm mb-2">
+                        <span className="font-black text-slate-700 dark:text-slate-300">{sub.code}</span>
+                        <span className="font-bold text-slate-500">{Math.round((done/subTotal)*100)}%</span>
+                      </div>
+                      <AnimatedProgressBar value={done} max={subTotal} color={sub.color} />
+                    </div>
+                  );
+                })}
+              </div>
+            </GlassCard>
+         </div>
+
+         <div className="space-y-8">
+            <GlassCard className="p-6 h-full">
+              <h3 className="text-xl font-bold mb-6 flex items-center gap-2">
+                <CalendarIcon className="text-indigo-500" /> Today's Classes
+              </h3>
+              <div className="space-y-4">
+                {todaysClasses.length === 0 ? (
+                  <div className="p-10 text-center text-slate-400 italic">No classes today. Focus on deep work.</div>
+                ) : (
+                  todaysClasses.map((cls, idx) => (
+                    <div key={idx} className="flex gap-4 p-4 rounded-2xl bg-slate-50 dark:bg-slate-700/50 border border-slate-100 dark:border-slate-700">
+                      <div className="px-3 py-1 bg-white dark:bg-slate-600 rounded-xl text-xs font-black h-fit shadow-sm">
+                        {cls.time}
+                      </div>
+                      <div className="flex-1">
+                        <p className="font-black text-slate-800 dark:text-slate-100 text-sm">{cls.sub?.code}</p>
+                        <p className="text-xs text-slate-500">{cls.sub?.name}</p>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </GlassCard>
+         </div>
+      </div>
+    </div>
+  );
+}
+
+const CardStat = ({ label, value, subLabel }) => (
+  <div className="bg-white dark:bg-slate-800 px-6 py-4 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm text-center">
+     <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">{label}</p>
+     <p className="text-2xl font-black text-indigo-600 dark:text-indigo-400 leading-none">{value}</p>
+     <p className="text-[10px] font-bold text-slate-500 mt-1">{subLabel}</p>
+  </div>
+);
+
+// --- SYLLABUS TRACKER ---
+function SyllabusTracker({ subjects, progress, userId }) {
+  const [selectedSubject, setSelectedSubject] = useState(null);
+  const [modal, setModal] = useState(null); // { type, topic, data, loading }
+
+  const toggleTopic = async (subjectId, topic) => {
+    const current = progress[subjectId] || [];
+    const updated = current.includes(topic) ? current.filter(t => t !== topic) : [...current, topic];
+    await setDoc(doc(db, `artifacts/${APP_ID}/users/${userId}`, 'progress', subjectId), { completedTopics: updated });
+  };
+
+  const handleAIAction = async (type, topic) => {
+    setModal({ type, topic, loading: true });
+    try {
+      let res;
+      if (type === 'explain') {
+        res = await callGemini(`Explain "${topic}" from the course "${selectedSubject.name}" for a college student. Simplify complex jargon and use 3 bullet points.`);
+        setModal(prev => ({ ...prev, data: String(res), loading: false }));
+      } else if (type === 'quiz') {
+        res = await callGemini(`Generate 3 tough multiple choice questions on "${topic}" from "${selectedSubject.name}". Format as JSON array: [{"q": "...", "o": ["A", "B", "C", "D"], "a": "correct_option"}]. No markdown.`, true);
+        setModal(prev => ({ ...prev, data: res, loading: false }));
+      }
+    } catch (e) {
+      setModal(null);
+      alert(e.message);
+    }
+  };
+
+  return (
+    <div className="space-y-8 h-full flex flex-col">
+       <div className="flex justify-between items-center">
+        <h2 className="text-3xl font-black tracking-tight">Curriculum Tracker</h2>
+        <div className="flex items-center gap-2 text-indigo-600 font-bold text-sm">
+          <Sparkles size={16} /> Powered by Gemini
+        </div>
+      </div>
+
+      <div className="flex-1 flex gap-8 overflow-hidden">
+        <div className="w-80 space-y-4 overflow-y-auto pr-2 custom-scrollbar">
+          {subjects.map(sub => (
+            <button 
+              key={sub.id}
+              onClick={() => setSelectedSubject(sub)}
+              className={`w-full text-left p-6 rounded-2xl border transition-all relative overflow-hidden group ${
+                selectedSubject?.id === sub.id 
+                  ? `border-${sub.color}-500 bg-white dark:bg-slate-800 shadow-xl` 
+                  : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
+              }`}
+            >
+              <div className={`absolute left-0 top-0 bottom-0 w-1.5 bg-${sub.color}-500`} />
+              <span className="font-black text-lg">{sub.code}</span>
+              <p className="text-sm font-bold text-slate-500 dark:text-slate-400 truncate">{sub.name}</p>
+            </button>
+          ))}
+        </div>
+
+        <div className="flex-1 bg-white dark:bg-slate-800 rounded-3xl border border-slate-200 dark:border-slate-700 p-8 overflow-y-auto custom-scrollbar">
+          {selectedSubject ? (
+            <div className="space-y-8 animate-fade-in">
+              <h3 className="text-2xl font-black">{selectedSubject.name}</h3>
+              {selectedSubject.units.map((unit, uIdx) => (
+                <div key={uIdx} className="space-y-4">
+                  <h4 className="text-sm font-black text-slate-400 uppercase tracking-widest border-b border-slate-100 dark:border-slate-700 pb-2">{unit.title}</h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {unit.topics.map((topic, tIdx) => {
+                      const isDone = (progress[selectedSubject.id] || []).includes(topic);
+                      return (
+                        <div key={tIdx} className={`p-4 rounded-2xl border transition-all flex items-center justify-between group ${isDone ? 'bg-emerald-50 dark:bg-emerald-900/10 border-emerald-100' : 'bg-slate-50 dark:bg-slate-700/30 border-slate-100'}`}>
+                          <div className="flex items-center gap-3">
+                             <button onClick={() => toggleTopic(selectedSubject.id, topic)} className={`w-6 h-6 rounded-lg border-2 flex items-center justify-center ${isDone ? 'bg-emerald-500 border-emerald-500 text-white' : 'bg-white dark:bg-slate-600 border-slate-300'}`}>
+                                {isDone && <CheckCircle2 size={14} />}
+                             </button>
+                             <span className={`text-sm font-bold ${isDone ? 'text-slate-400 line-through' : ''}`}>{topic}</span>
+                          </div>
+                          <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                             <button onClick={() => handleAIAction('explain', topic)} title="AI Explain ✨" className="p-2 text-indigo-400 hover:bg-white dark:hover:bg-slate-600 rounded-xl"><Sparkles size={14} /></button>
+                             <button onClick={() => handleAIAction('quiz', topic)} title="Quiz Master ✨" className="p-2 text-purple-400 hover:bg-white dark:hover:bg-slate-600 rounded-xl"><Zap size={14} /></button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="h-full flex items-center justify-center text-slate-400 font-bold">Select a subject to begin</div>
+          )}
+        </div>
+      </div>
+
+      {modal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[60] flex items-center justify-center p-4">
+           <GlassCard className="max-w-xl w-full p-8 relative overflow-hidden">
+              <button onClick={() => setModal(null)} className="absolute top-4 right-4 text-slate-400 hover:text-slate-900"><X size={20}/></button>
+              <h3 className="font-black text-xl mb-4 flex items-center gap-2">
+                {modal.type === 'explain' ? <Sparkles className="text-indigo-500" /> : <Zap className="text-purple-500" />}
+                {modal.type === 'explain' ? 'Concept Explanation' : 'Quick Quiz ✨'}
+              </h3>
+              <p className="text-xs font-black text-slate-500 uppercase mb-4">{modal.topic}</p>
+              
+              {modal.loading ? (
+                <div className="py-12 flex flex-col items-center gap-4 text-indigo-500">
+                   <Loader2 className="animate-spin w-10 h-10" />
+                   <span className="font-bold animate-pulse">Consulting AI Knowledge Base...</span>
+                </div>
+              ) : (
+                <div className="max-h-[60vh] overflow-y-auto pr-2 custom-scrollbar">
+                   {modal.type === 'explain' ? (
+                     <div className="text-slate-700 dark:text-slate-300 leading-relaxed font-medium whitespace-pre-wrap">{String(modal.data)}</div>
+                   ) : (
+                     <div className="space-y-6">
+                        {Array.isArray(modal.data) && modal.data.map((q, i) => (
+                           <div key={i} className="p-4 bg-slate-50 dark:bg-slate-700 rounded-2xl">
+                              <p className="font-bold text-sm mb-3">Q{i+1}: {q.q}</p>
+                              <div className="grid grid-cols-1 gap-2">
+                                 {Array.isArray(q.o) && q.o.map((o, j) => (
+                                    <button key={j} className="text-left px-4 py-2 bg-white dark:bg-slate-600 hover:bg-indigo-50 dark:hover:bg-slate-500 rounded-xl text-xs font-medium border border-slate-100 transition-colors">
+                                       {o}
+                                    </button>
+                                 ))}
+                              </div>
+                           </div>
+                        ))}
+                     </div>
+                   )}
+                </div>
+              )}
+           </GlassCard>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- NOTES WALL ---
+function NotesWall({ subjects, notes, userId }) {
+  const [isAdding, setIsAdding] = useState(false);
+  const [noteForm, setNoteForm] = useState({ title: '', content: '', subjectId: '', color: 'yellow' });
+  const [optimizingId, setOptimizingId] = useState(null);
+
+  const saveNote = async () => {
+    if (!noteForm.title.trim()) return;
+    await addDoc(collection(db, `artifacts/${APP_ID}/users/${userId}`, 'notes'), { ...noteForm, createdAt: serverTimestamp() });
+    setNoteForm({ title: '', content: '', subjectId: '', color: 'yellow' });
+    setIsAdding(false);
+  };
+
+  const deleteNote = (id) => deleteDoc(doc(db, `artifacts/${APP_ID}/users/${userId}`, 'notes', id));
+
+  const optimizeNote = async (note) => {
+    setOptimizingId(note.id);
+    try {
+      const prompt = `Refine this student note into a high-quality summary. Note Title: "${note.title}". Content: "${note.content}". 
+      Clean up grammar, use bullet points if needed, and make it professional. Output only the refined content.`;
+      const res = await callGemini(prompt);
+      await updateDoc(doc(db, `artifacts/${APP_ID}/users/${userId}`, 'notes', note.id), { content: String(res) });
+    } catch (e) {
+      alert("AI optimization failed.");
+    } finally {
+      setOptimizingId(null);
+    }
+  };
+
+  const colors = {
+    yellow: "bg-yellow-50 dark:bg-yellow-900/20 border-yellow-200 dark:border-yellow-900/40",
+    indigo: "bg-indigo-50 dark:bg-indigo-900/20 border-indigo-200 dark:border-indigo-900/40",
+    emerald: "bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200 dark:border-emerald-900/40",
+    rose: "bg-rose-50 dark:bg-rose-900/20 border-rose-200 dark:border-rose-900/40"
+  };
+
+  return (
+    <div className="h-full flex flex-col space-y-6">
+       <div className="flex justify-between items-center">
+          <h2 className="text-3xl font-black tracking-tight">Sticky Wall</h2>
+          <Button onClick={() => setIsAdding(true)} size="lg"><Plus size={20}/> Add Note</Button>
+       </div>
+
+       <div className="flex-1 overflow-y-auto custom-scrollbar pb-20">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+             {notes.map(note => {
+               const sub = subjects.find(s => s.id === note.subjectId);
+               return (
+                 <div key={note.id} className={`p-6 rounded-3xl border shadow-sm flex flex-col min-h-[220px] group relative animate-fade-in ${colors[note.color] || colors.yellow}`}>
+                    <div className="flex justify-between items-start mb-4">
+                       <h4 className="font-black text-lg leading-tight text-slate-800 dark:text-slate-100">{note.title}</h4>
+                       <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                         <button 
+                            onClick={() => optimizeNote(note)} 
+                            disabled={optimizingId === note.id}
+                            className={`p-2 rounded-lg hover:bg-white/50 text-indigo-600 ${optimizingId === note.id ? 'animate-spin' : ''}`}
+                            title="Optimize ✨"
+                         >
+                            {optimizingId === note.id ? <Loader2 size={16}/> : <Wand2 size={16}/>}
+                         </button>
+                         <button onClick={() => deleteNote(note.id)} className="p-2 text-slate-500 hover:text-red-500 transition-all"><Trash2 size={16}/></button>
+                       </div>
+                    </div>
+                    <p className="text-sm font-medium text-slate-600 dark:text-slate-300 flex-1 whitespace-pre-wrap">{note.content}</p>
+                    {sub && <span className="mt-4 text-[10px] font-black uppercase tracking-widest text-slate-400">{sub.code} Linked</span>}
+                 </div>
+               );
+             })}
+          </div>
+       </div>
+
+       {isAdding && (
+         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[60] flex items-center justify-center p-4">
+            <GlassCard className="max-w-md w-full p-8">
+               <h3 className="font-black text-xl mb-6">Create New Note</h3>
+               <div className="space-y-4">
+                  <input className="w-full p-3 rounded-xl bg-slate-50 dark:bg-slate-700 border border-slate-200 text-sm font-bold" placeholder="Title..." value={noteForm.title} onChange={e => setNoteForm({...noteForm, title: e.target.value})} />
+                  <textarea className="w-full h-40 p-3 rounded-xl bg-slate-50 dark:bg-slate-700 border border-slate-200 text-sm font-medium resize-none" placeholder="Write something..." value={noteForm.content} onChange={e => setNoteForm({...noteForm, content: e.target.value})} />
+                  <div className="flex gap-2">
+                     {Object.keys(colors).map(c => (
+                        <button key={c} onClick={() => setNoteForm({...noteForm, color: c})} className={`w-8 h-8 rounded-full border-4 ${noteForm.color === c ? 'border-indigo-500 scale-110' : 'border-transparent'} ${colors[c].split(' ')[0]}`} />
+                     ))}
+                  </div>
+                  <div className="flex gap-2 pt-4">
+                     <Button variant="secondary" className="flex-1" onClick={() => setIsAdding(false)}>Cancel</Button>
+                     <Button className="flex-1" onClick={saveNote}>Save Note</Button>
+                  </div>
+               </div>
+            </GlassCard>
+         </div>
+       )}
+    </div>
+  );
+}
+
+// Helpers
+const Button = ({ children, onClick, variant = "primary", className = "", disabled = false, size="md" }) => {
+  const baseStyle = "rounded-lg font-bold transition-all duration-200 flex items-center justify-center gap-2 active:scale-95 disabled:opacity-50";
+  const sizes = { sm: "px-3 py-1.5 text-xs", md: "px-4 py-2 text-sm", lg: "px-6 py-3 text-base" };
+  const variants = {
+    primary: "bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg",
+    secondary: "bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:bg-slate-50",
+    gemini: "bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-xl hover:shadow-indigo-500/20"
+  };
+  return <button onClick={onClick} className={`${baseStyle} ${sizes[size]} ${variants[variant]} ${className}`} disabled={disabled}>{children}</button>;
+};
+
+const CalendarView = ({ subjects, timetable, events, userId }) => <div className="p-8"><h2 className="text-2xl font-black">Calendar</h2><p className="text-slate-400">Monthly schedule visualization.</p></div>;
+const WeeklyPlanner = ({ subjects, weeklyPlan, userId }) => <div className="p-8"><h2 className="text-2xl font-black">Weekly Sprint</h2><p className="text-slate-400">Task management board.</p></div>;
+const TimetableEditor = ({ subjects, timetable, userId }) => <div className="p-8"><h2 className="text-2xl font-black">Timetable</h2><p className="text-slate-400">Class schedule editor.</p></div>;
